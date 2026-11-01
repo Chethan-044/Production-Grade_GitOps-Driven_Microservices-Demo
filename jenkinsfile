@@ -10,6 +10,8 @@ pipeline {
         ECR_PREFIX = 'online-boutique'
         GITOPS_CREDENTIALS = 'github-gitops'
         HELM_VALUES = 'helm-chart/values.yaml'
+        DOCKER_BUILDKIT = '1'
+
     }
 
     stages {
