@@ -1,0 +1,219 @@
+
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        AWS_ACCOUNT_ID = '216482850616'
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+        ECR_PREFIX = 'online-boutique'
+        GITOPS_CREDENTIALS = 'github-gitops'
+        HELM_VALUES = 'helm-chart/values.yaml'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+
+                script {
+                    env.IMAGE_TAG = sh(
+                        script: 'git rev-parse --short=12 HEAD',
+                        returnStdout: true
+                    ).trim()
+
+                    echo "Building commit: ${IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Verify Tools') {
+            steps {
+                sh '''
+                    set -e
+                    git --version
+                    docker --version
+                    aws --version
+                    python3 --version
+                '''
+            }
+        }
+
+        stage('AWS Authentication') {
+            steps {
+                sh '''
+                    set -e
+
+                    aws sts get-caller-identity
+
+                    aws ecr get-login-password \
+                      --region ${AWS_REGION} |
+                    docker login \
+                      --username AWS \
+                      --password-stdin ${ECR_REGISTRY}
+                '''
+            }
+        }
+
+        stage('Create ECR Repositories') {
+            steps {
+                script {
+                    def services = [
+                        'adservice',
+                        'cartservice',
+                        'checkoutservice',
+                        'currencyservice',
+                        'emailservice',
+                        'frontend',
+                        'loadgenerator',
+                        'paymentservice',
+                        'productcatalogservice',
+                        'recommendationservice',
+                        'shippingservice'
+                    ]
+
+                    services.each { service ->
+                        sh """
+                            aws ecr describe-repositories \
+                              --repository-names ${ECR_PREFIX}/${service} \
+                              --region ${AWS_REGION} \
+                            || aws ecr create-repository \
+                              --repository-name ${ECR_PREFIX}/${service} \
+                              --region ${AWS_REGION}
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Build and Push Images') {
+            steps {
+                script {
+                    def services = [
+                        'adservice',
+                        'cartservice',
+                        'checkoutservice',
+                        'currencyservice',
+                        'emailservice',
+                        'frontend',
+                        'loadgenerator',
+                        'paymentservice',
+                        'productcatalogservice',
+                        'recommendationservice',
+                        'shippingservice'
+                    ]
+
+                    services.each { service ->
+                        echo "Building ${service}"
+
+                        sh """
+                            docker build \
+                              -t ${ECR_REGISTRY}/${ECR_PREFIX}/${service}:${IMAGE_TAG} \
+                              -t ${ECR_REGISTRY}/${ECR_PREFIX}/${service}:latest \
+                              ./src/${service}
+
+                            docker push \
+                              ${ECR_REGISTRY}/${ECR_PREFIX}/${service}:${IMAGE_TAG}
+
+                            docker push \
+                              ${ECR_REGISTRY}/${ECR_PREFIX}/${service}:latest
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Update Helm Values') {
+            steps {
+                sh '''
+                    python3 - <<'PY'
+import yaml
+import os
+
+values_file = os.environ["HELM_VALUES"]
+registry = os.environ["ECR_REGISTRY"]
+prefix = os.environ["ECR_PREFIX"]
+tag = os.environ["IMAGE_TAG"]
+
+with open(values_file, "r") as f:
+    values = yaml.safe_load(f)
+
+services = [
+    "adservice",
+    "cartservice",
+    "checkoutservice",
+    "currencyservice",
+    "emailservice",
+    "frontend",
+    "loadgenerator",
+    "paymentservice",
+    "productcatalogservice",
+    "recommendationservice",
+    "shippingservice"
+]
+
+for service in services:
+    if service not in values:
+        raise ValueError(f"Service {service} missing in Helm values")
+
+    values[service]["image"]["repository"] = (
+        f"{registry}/{prefix}/{service}"
+    )
+    values[service]["image"]["tag"] = tag
+
+with open(values_file, "w") as f:
+    yaml.safe_dump(values, f, sort_keys=False)
+
+print("Helm image values updated successfully")
+PY
+                '''
+            }
+        }
+
+        stage('Push GitOps Changes') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: "${GITOPS_CREDENTIALS}",
+                        usernameVariable: 'GIT_USER',
+                        passwordVariable: 'GIT_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -e
+
+                        git config user.name "Jenkins"
+                        git config user.email "jenkins@localhost"
+
+                        git add ${HELM_VALUES}
+
+                        if git diff --cached --quiet; then
+                            echo "No Helm changes to commit"
+                            exit 0
+                        fi
+
+                        git commit -m "Update Online Boutique images to ${IMAGE_TAG}"
+
+                        git push https://${GIT_USER}:${GIT_TOKEN}@github.com/${GIT_REPOSITORY}.git HEAD:main
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'CI completed. Argo CD will detect the GitOps changes.'
+        }
+
+        failure {
+            echo 'Pipeline failed. Check the failed stage logs.'
+        }
+
+        always {
+            sh 'docker logout ${ECR_REGISTRY} || true'
+        }
+    }
+}
