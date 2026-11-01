@@ -2,16 +2,21 @@
 pipeline {
     agent any
 
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+    }
+
     environment {
         AWS_REGION = 'us-east-1'
         AWS_ACCOUNT_ID = '216482850616'
-        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
         ECR_PREFIX = 'online-boutique'
-        GITOPS_CREDENTIALS = 'github-gitops'
-        HELM_VALUES = 'helm-chart/values.yaml'
+
         DOCKER_BUILDKIT = '1'
 
+        HELM_VALUES = 'helm-chart/values.yaml'
     }
 
     stages {
@@ -19,42 +24,32 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout scm
+            }
+        }
 
+        stage('Initialize') {
+            steps {
                 script {
                     env.IMAGE_TAG = sh(
                         script: 'git rev-parse --short=12 HEAD',
                         returnStdout: true
                     ).trim()
 
-                    echo "Building commit: ${IMAGE_TAG}"
+                    echo "Image tag: ${env.IMAGE_TAG}"
                 }
-            }
-        }
-
-        stage('Verify Tools') {
-            steps {
-                sh '''
-                    set -e
-                    git --version
-                    docker --version
-                    aws --version
-                    python3 --version
-                '''
             }
         }
 
         stage('AWS Authentication') {
             steps {
                 sh '''
-                    set -e
-
                     aws sts get-caller-identity
 
                     aws ecr get-login-password \
-                      --region ${AWS_REGION} |
-                    docker login \
+                      --region "$AWS_REGION" | \
+                      docker login \
                       --username AWS \
-                      --password-stdin ${ECR_REGISTRY}
+                      --password-stdin "$ECR_REGISTRY"
                 '''
             }
         }
@@ -80,8 +75,8 @@ pipeline {
                         sh """
                             aws ecr describe-repositories \
                               --repository-names ${ECR_PREFIX}/${service} \
-                              --region ${AWS_REGION} \
-                            || aws ecr create-repository \
+                              --region ${AWS_REGION} >/dev/null 2>&1 || \
+                            aws ecr create-repository \
                               --repository-name ${ECR_PREFIX}/${service} \
                               --region ${AWS_REGION}
                         """
@@ -108,13 +103,24 @@ pipeline {
                     ]
 
                     services.each { service ->
+
                         echo "Building ${service}"
+
+                        def dockerfile = "./src/${service}/Dockerfile"
+                        def context = "./src/${service}"
+
+                        // Cartservice has a nested Dockerfile
+                        if (service == 'cartservice') {
+                            dockerfile = './src/cartservice/src/Dockerfile'
+                            context = './src/cartservice/src'
+                        }
 
                         sh """
                             docker build \
+                              -f ${dockerfile} \
                               -t ${ECR_REGISTRY}/${ECR_PREFIX}/${service}:${IMAGE_TAG} \
                               -t ${ECR_REGISTRY}/${ECR_PREFIX}/${service}:latest \
-                              ./src/${service}
+                              ${context}
 
                             docker push \
                               ${ECR_REGISTRY}/${ECR_PREFIX}/${service}:${IMAGE_TAG}
@@ -131,16 +137,9 @@ pipeline {
             steps {
                 sh '''
                     python3 - <<'PY'
-import yaml
 import os
-
-values_file = os.environ["HELM_VALUES"]
-registry = os.environ["ECR_REGISTRY"]
-prefix = os.environ["ECR_PREFIX"]
-tag = os.environ["IMAGE_TAG"]
-
-with open(values_file, "r") as f:
-    values = yaml.safe_load(f)
+import re
+from pathlib import Path
 
 services = [
     "adservice",
@@ -156,20 +155,62 @@ services = [
     "shippingservice"
 ]
 
+registry = os.environ["ECR_REGISTRY"]
+prefix = os.environ["ECR_PREFIX"]
+tag = os.environ["IMAGE_TAG"]
+
+path = Path(os.environ["HELM_VALUES"])
+content = path.read_text()
+
 for service in services:
-    if service not in values:
-        raise ValueError(f"Service {service} missing in Helm values")
 
-    values[service]["image"]["repository"] = (
-        f"{registry}/{prefix}/{service}"
+    pattern = re.compile(
+        rf"(?ms)(^  {re.escape(service)}:\\n)(.*?)(?=^  [A-Za-z][A-Za-z0-9]*:\\n|^serviceAccounts:)"
     )
-    values[service]["image"]["tag"] = tag
 
-with open(values_file, "w") as f:
-    yaml.safe_dump(values, f, sort_keys=False)
+    match = pattern.search(content)
 
-print("Helm image values updated successfully")
+    if not match:
+        raise RuntimeError(
+            f"Could not find images.{service} in {path}"
+        )
+
+    block = match.group(2)
+
+    repository = f"{registry}/{prefix}/{service}"
+
+    block, repo_count = re.subn(
+        r"(?m)^    repository:.*$",
+        f"    repository: {repository}",
+        block,
+        count=1
+    )
+
+    block, tag_count = re.subn(
+        r"(?m)^    tag:.*$",
+        f"    tag: {tag}",
+        block,
+        count=1
+    )
+
+    if repo_count != 1 or tag_count != 1:
+        raise RuntimeError(
+            f"Could not update repository/tag for {service}"
+        )
+
+    content = (
+        content[:match.start(2)]
+        + block
+        + content[match.end(2):]
+    )
+
+path.write_text(content)
+
+print("Updated Helm image repositories and tags successfully.")
 PY
+
+                    echo "Updated Helm values:"
+                    grep -A3 -E '^  (adservice|cartservice|checkoutservice|currencyservice|emailservice|frontend|loadgenerator|paymentservice|productcatalogservice|recommendationservice|shippingservice):' "$HELM_VALUES"
                 '''
             }
         }
@@ -178,27 +219,42 @@ PY
             steps {
                 withCredentials([
                     usernamePassword(
-                        credentialsId: "${GITOPS_CREDENTIALS}",
-                        usernameVariable: 'GIT_USER',
-                        passwordVariable: 'GIT_TOKEN'
+                        credentialsId: 'github-gitops',
+                        usernameVariable: 'GIT_USERNAME',
+                        passwordVariable: 'GIT_PASSWORD'
                     )
                 ]) {
                     sh '''
-                        set -e
+                        set +x
 
                         git config user.name "Jenkins"
                         git config user.email "jenkins@localhost"
 
-                        git add ${HELM_VALUES}
+                        git add "$HELM_VALUES"
 
                         if git diff --cached --quiet; then
-                            echo "No Helm changes to commit"
-                            exit 0
+                            echo "No Helm changes to commit."
+                        else
+                            git commit -m "Update Online Boutique images to ${IMAGE_TAG}"
+
+                            cat > .git-askpass.sh <<'EOF'
+#!/bin/sh
+case "$1" in
+    *Username*) printf '%s\\n' "$GIT_USERNAME" ;;
+    *Password*) printf '%s\\n' "$GIT_PASSWORD" ;;
+esac
+EOF
+
+                            chmod 700 .git-askpass.sh
+                            trap 'rm -f .git-askpass.sh' EXIT
+
+                            git fetch origin main
+                            git rebase origin/main
+
+                            GIT_ASKPASS="$PWD/.git-askpass.sh" \
+                            GIT_TERMINAL_PROMPT=0 \
+                            git push origin HEAD:main
                         fi
-
-                        git commit -m "Update Online Boutique images to ${IMAGE_TAG}"
-
-                        git push https://${GIT_USER}:${GIT_TOKEN}@github.com/${GIT_REPOSITORY}.git HEAD:main
                     '''
                 }
             }
@@ -206,16 +262,18 @@ PY
     }
 
     post {
+        always {
+            sh '''
+                docker logout "$ECR_REGISTRY" || true
+            '''
+        }
+
         success {
-            echo 'CI completed. Argo CD will detect the GitOps changes.'
+            echo 'Online Boutique CI pipeline completed successfully!'
         }
 
         failure {
-            echo 'Pipeline failed. Check the failed stage logs.'
-        }
-
-        always {
-            sh 'docker logout ${ECR_REGISTRY} || true'
+            echo 'Pipeline failed. Check the failed stage in Console Output.'
         }
     }
 }
